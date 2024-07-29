@@ -24,6 +24,7 @@ const (
 type H struct {
 	port    int
 	version string
+	source  map[string]*strings.Builder
 }
 
 var hp *H
@@ -33,6 +34,7 @@ func NewInstance() *H {
 		hp = &H{
 			port:    Port,
 			version: Version,
+			source:  make(map[string]*strings.Builder),
 		}
 	}
 	return hp
@@ -73,20 +75,6 @@ func findRequstKey(peek []byte) string {
 		return "CONNECT"
 	} else if strings.Contains(line, "PATCH") {
 		return "PATCH"
-	} else if strings.Contains(line, "PROPFIND") {
-		return "PROPFIND"
-	} else if strings.Contains(line, "PROPPATCH") {
-		return "PROPPATCH"
-	} else if strings.Contains(line, "MKCOL") {
-		return "MKCOL"
-	} else if strings.Contains(line, "COPY") {
-		return "COPY"
-	} else if strings.Contains(line, "MOVE") {
-		return "MOVE"
-	} else if strings.Contains(line, "LOCK") {
-		return "LOCK"
-	} else if strings.Contains(line, "UNLOCK") {
-		return "UNLOCK"
 	}
 	return ""
 }
@@ -100,11 +88,18 @@ var seq int = 0
 
 func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 	bio := bufio.NewReader(buf)
-	sb := strings.Builder{}
+	uuid := fmt.Sprintf("%v:%v:%v:%v", net.Src(), transport.Src(), net.Dst(), transport.Dst())
+
+	if _, ok := m.source[uuid]; !ok {
+		m.source[uuid] = &strings.Builder{}
+	}
+
 	waf := metawaf.Metawaf{}
 	waf.Init()
 
 	var isRequestStream = false
+	var contentLength int64 = 0
+	var reqState int = 0
 	//lseq := seq
 	//seq++
 	for {
@@ -116,14 +111,16 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 			continue // Skip to the next iteration
 		}
 
-		//fmt.Printf("seq : %d >", lseq)
-		//fmt.Println(string(line))
 		if isRequestLine(line) || isRequestStream == true {
 			isRequestStream = true
-			if isRequestLine(line) {
-				//Split if combing multiple bytes
+			if isRequestLine(line) || reqState == 2 { //All line recieve
 				key := findRequstKey(line)
+				sb, _ := m.source[uuid]
 				if sb.Len() > 0 {
+					if reqState == 2 {
+						reqState = 0
+					}
+
 					if key != "" {
 						lindex := strings.Index(string(line), key)
 						if lindex > 0 {
@@ -144,14 +141,39 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 				}
 			}
 
+			sb, _ := m.source[uuid]
 			if string(line) == "" {
 				sb.WriteString("\r\n")
+				reqState = 1
 				continue
 			}
+
+			//if Content-Length line
+			if strings.Contains(string(line), "Content-Length") {
+				//Calcluate Content-Length
+				lindex := strings.Index(string(line), ":")
+				if lindex > 0 {
+					clen := strings.TrimSpace(string(line[lindex+1:]))
+					if clen != "" {
+						//Convert 0x123 to int
+						contentLength, _ = strconv.ParseInt(clen, 16, 64)
+					}
+				}
+			}
+
+			if reqState == 1 {
+				lenx := len(line)
+				contentLength = contentLength - int64(lenx)
+				if contentLength <= 0 {
+					reqState = 2
+				}
+			}
+
 			sb.Write(line)
 			sb.WriteString("\n")
 		} else if isResponseLine(line) || isRequestStream != true {
 			isRequestStream = false
+			sb, _ := m.source[uuid]
 			if isResponseLine(line) {
 				if sb.Len() > 0 {
 					peek := string(line)
@@ -178,7 +200,7 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 			sb.WriteString("\n")
 		}
 	}
-
+	sb, _ := m.source[uuid]
 	if isRequestStream {
 		waf.ProcessRequest(sb.String())
 	} else {

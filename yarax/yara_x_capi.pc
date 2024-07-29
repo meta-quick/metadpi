@@ -1,0 +1,10 @@
+prefix=/Users/gaosg/Projects/metadpi/yarax
+exec_prefix=${prefix}
+libdir=${exec_prefix}/
+includedir=${prefix}/
+
+Name: yara_x_capi
+Description: YARA C API
+Version: 1.0.0
+Libs: -L${libdir} -lyara_x_capi
+Cflags: -I${includedir}

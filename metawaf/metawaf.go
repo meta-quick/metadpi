@@ -1,10 +1,17 @@
 package metawaf
 
+import "C"
 import (
 	"bufio"
 	"fmt"
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/types"
+	yara_x "github.com/meta-quick/metadpi/yarax"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+
+	//"github.com/meta-quick/metadpi/yarax"
 	"io"
 	"log"
 	"net/http"
@@ -12,8 +19,10 @@ import (
 )
 
 type Metawaf struct {
-	waf coraza.WAF
-	cfg coraza.WAFConfig
+	waf      coraza.WAF
+	compiler *yara_x.Compiler
+	scanner  *yara_x.Scanner
+	cfg      coraza.WAFConfig
 }
 
 func (m *Metawaf) Init() {
@@ -28,6 +37,81 @@ func (m *Metawaf) Init() {
 	}
 	m.waf = waf
 	m.cfg = config
+
+	m.InitYaraCompiler()
+	m.AddRuleFromPath("./dataruleset", "datasafe")
+	m.buildScanner()
+}
+
+func (m *Metawaf) InitYaraCompiler() {
+	m.compiler, _ = yara_x.NewCompiler()
+}
+
+func (m *Metawaf) buildScanner() {
+	m.scanner = yara_x.NewScanner(m.compiler.Build())
+}
+
+func (m *Metawaf) AddNamespace(ns string) {
+	m.compiler.NewNamespace(ns)
+}
+
+func (m *Metawaf) AddRule(rule string, ns string) {
+	if ns == "" {
+		err := m.compiler.AddSource(rule)
+		if err != nil {
+			return
+		}
+	} else {
+		m.compiler.NewNamespace(ns)
+		err := m.compiler.AddSource(rule)
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (m *Metawaf) AddRuleFromPath(path string, ns string) {
+	if ns == "" {
+		m.AddRulePth(path)
+	} else {
+		m.AddNamespace(ns)
+		m.AddRulePth(path)
+	}
+}
+
+func (m *Metawaf) AddRulePth(path string) {
+	//walk the directory to list all files with yar or yara
+	err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		// Check if the file has a .yar or .yara extension
+		if !info.IsDir() && (filepath.Ext(filePath) == ".yar" || filepath.Ext(filePath) == ".yara") {
+			content, err := ioutil.ReadFile(filePath)
+			if err != nil {
+				return fmt.Errorf("failed to read file %s: %v", filePath, err)
+			}
+
+			// Add the file content to the compiler
+			m.compiler.AddSource(string(content))
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+}
+
+func (m *Metawaf) YaraScan(data []byte) ([]*yara_x.Rule, error) {
+	if m.scanner == nil {
+		return nil, fmt.Errorf("scanner is not initialized")
+	}
+
+	rules, err := m.scanner.Scan(data)
+	if err != nil {
+		return nil, err
+	}
+	return rules, nil
 }
 
 func (m *Metawaf) Begin() types.Transaction {
@@ -166,22 +250,58 @@ func (m *Metawaf) ProcessRequest(requestData string) {
 	// Check for WAF intervention
 	if tx.IsInterrupted() {
 		intervention := tx.Interruption()
-		log.Printf("!!!!!Request blocked by WAF: %d, %s, %s", intervention.RuleID, intervention.Data, intervention.Action)
+		log.Printf("\n!!!!!Request blocked by WAF: %d, %s, %s", intervention.RuleID, intervention.Data, intervention.Action)
 	} else {
-		log.Println("!!!!!Request allowed by WAF")
+		log.Println("\n!!!!!Request allowed by WAF")
 	}
 }
 
 func (m *Metawaf) ProcessResponse(responseData string) {
-	tx := m.waf.NewTransaction()
-	defer tx.Close()
-
-	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(responseData)), nil)
+	matchingRules, err := m.YaraScan([]byte(responseData))
 	if err != nil {
-		log.Printf("Error reading response: %v", err)
-		return
+		log.Printf("Error scanning response: %v", err)
 	}
-	fmt.Println(resp)
+
+	if len(matchingRules) > 0 {
+		printRules(matchingRules)
+	}
+}
+
+func printRules(rules []*yara_x.Rule) {
+	for _, rule := range rules {
+		fmt.Printf("Namespace: %s\n", rule.Namespace())
+		fmt.Printf("Identifier: %s\n", rule.Identifier())
+
+		metas := rule.Metadata()
+		if metas != nil {
+			fmt.Printf("Metadata:\n")
+			for _, meta := range metas {
+				fmt.Printf(" Identifier: %s; ", meta.Identifier)
+
+				switch meta.Value.(type) {
+				case string:
+					fmt.Printf(" Value: %s\n", meta.Value.(string))
+				case int64:
+					fmt.Printf(" Value: %d\n", meta.Value.(int64))
+				case float64:
+					fmt.Printf(" Value: %f\n", meta.Value.(float64))
+				case bool:
+					fmt.Printf(" Value: %t\n", meta.Value.(bool))
+				}
+			}
+		}
+
+		patterns := rule.Patterns()
+		if patterns != nil {
+			fmt.Printf("Patterns:")
+			for _, pattern := range patterns {
+				fmt.Printf("\n Identifier: %s; ", pattern.Identifier())
+				for _, match := range pattern.Matches() {
+					fmt.Printf("\n   match: offset:%d,length:%d", match.Offset(), match.Length())
+				}
+			}
+		}
+	}
 }
 
 func New() *Metawaf {
