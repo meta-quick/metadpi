@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/google/gopacket"
+	"github.com/meta-quick/gocodec"
 	"github.com/meta-quick/metadpi/metawaf"
 	"io"
 	"log"
@@ -24,7 +25,7 @@ const (
 type H struct {
 	port    int
 	version string
-	source  map[string]*strings.Builder
+	source  map[string]*gocodec.Buffer
 }
 
 var hp *H
@@ -34,7 +35,7 @@ func NewInstance() *H {
 		hp = &H{
 			port:    Port,
 			version: Version,
-			source:  make(map[string]*strings.Builder),
+			source:  make(map[string]*gocodec.Buffer),
 		}
 	}
 	return hp
@@ -91,7 +92,7 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 	uuid := fmt.Sprintf("%v:%v:%v:%v", net.Src(), transport.Src(), net.Dst(), transport.Dst())
 
 	if _, ok := m.source[uuid]; !ok {
-		m.source[uuid] = &strings.Builder{}
+		m.source[uuid] = &gocodec.Buffer{}
 	}
 
 	waf := metawaf.Metawaf{}
@@ -100,6 +101,7 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 	var isRequestStream = false
 	var contentLength int64 = 0
 	var reqState int = 0
+	var respState int = 0
 	//lseq := seq
 	//seq++
 	for {
@@ -117,21 +119,30 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 				key := findRequstKey(line)
 				sb, _ := m.source[uuid]
 				if sb.Len() > 0 {
-					if reqState == 2 {
-						reqState = 0
-					}
-
 					if key != "" {
 						lindex := strings.Index(string(line), key)
 						if lindex > 0 {
+							if reqState == 2 {
+								reqState = 0
+							}
 							sb.Write(line[:lindex])
-							waf.ProcessRequest(sb.String())
+							//take all bytes
+							databuf := make([]byte, sb.Len())
+							sb.Read(databuf)
+							waf.ProcessRequest(string(databuf))
+							//we assume only one request in queue
 							sb.Reset()
 							sb.Write(line[lindex:])
 							sb.WriteString("\n")
 							continue
-						} else if 0 == lindex {
-							waf.ProcessRequest(sb.String())
+						} else {
+							if reqState == 2 {
+								reqState = 0
+							}
+							databuf := make([]byte, sb.Len())
+							sb.Read(databuf)
+							waf.ProcessRequest(string(databuf))
+
 							sb.Reset()
 							sb.Write(line)
 							sb.WriteString("\n")
@@ -174,20 +185,42 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 		} else if isResponseLine(line) || isRequestStream != true {
 			isRequestStream = false
 			sb, _ := m.source[uuid]
-			if isResponseLine(line) {
+
+			if respState == 2 && string(line) == "0" { //Last chunk
+				respState = 3 //Last chunk
+			}
+
+			if 1 == respState && string(line) == "0" { //Header complete
+				respState = 2 //First chunk
+			}
+
+			//Transfer-Encoding: chunked
+			if strings.Contains(string(line), "Transfer-Encoding") {
+				respState = 1 //Chunked
+			}
+
+			if isResponseLine(line) || respState == 3 {
 				if sb.Len() > 0 {
 					peek := string(line)
-					if strings.Contains(peek, "HTTP") {
+					if strings.Contains(peek, "HTTP") || respState == 3 {
 						lindex := strings.Index(string(line), "HTTP")
 						if lindex > 0 {
+							respState = 0
 							sb.Write(line[:lindex])
-							waf.ProcessResponse(sb.String())
+
+							databuf := make([]byte, sb.Len())
+							sb.Read(databuf)
+							waf.ProcessResponse(string(databuf))
 							sb.Reset()
 							sb.Write(line[lindex:])
 							sb.WriteString("\n")
 							continue
-						} else if 0 == lindex {
-							waf.ProcessResponse(sb.String())
+						} else {
+							respState = 0
+							databuf := make([]byte, sb.Len())
+							sb.Read(databuf)
+
+							waf.ProcessResponse(string(databuf))
 							sb.Reset()
 							sb.Write(line)
 							sb.WriteString("\n")
@@ -202,9 +235,13 @@ func (m *H) ResolveStream(net, transport gopacket.Flow, buf io.Reader) {
 	}
 	sb, _ := m.source[uuid]
 	if isRequestStream {
-		waf.ProcessRequest(sb.String())
+		databuf := make([]byte, sb.Len())
+		sb.Read(databuf)
+		waf.ProcessRequest(string(databuf))
 	} else {
-		waf.ProcessResponse(sb.String())
+		databuf := make([]byte, sb.Len())
+		sb.Read(databuf)
+		waf.ProcessResponse(string(databuf))
 	}
 }
 
